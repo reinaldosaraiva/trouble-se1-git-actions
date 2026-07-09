@@ -1,0 +1,21 @@
+# Action da regiao ne1 (Nordeste) — container-registry.br-ne1.magalu.cloud
+name: Registry ne1
+
+on:
+  workflow_dispatch:
+    inputs:
+      registry_name:
+        description: "nome-do-registro (namespace ne1). Vazio = so build+login."
+        required: false
+        default: ""
+
+jobs:
+  ne1:
+    uses: ./.github/workflows/_registry-build-push.yml
+    with:
+      region: ne1
+      registry: container-registry.br-ne1.magalu.cloud
+      registry_name: ${{ inputs.registry_name }}
+    secrets:
+      MGC_USER: ${{ secrets.MGC_NE1_USER }}
+      MGC_PASS: ${{ secrets.MGC_NE1_PASSWORD }}

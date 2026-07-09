@@ -1,0 +1,91 @@
+# Workflow reusavel: build + docker login (com retry) + push, parametrizado por regiao.
+# Chamado por registry-se1.yml e registry-ne1.yml. Nao roda sozinho.
+name: _registry-build-push (reusavel)
+
+on:
+  workflow_call:
+    inputs:
+      region:
+        description: "se1 ou ne1"
+        required: true
+        type: string
+      registry:
+        description: "hostname do registry"
+        required: true
+        type: string
+      registry_name:
+        description: "namespace/registro; vazio = so build+login"
+        required: false
+        default: ""
+        type: string
+    secrets:
+      MGC_USER:
+        required: true
+      MGC_PASS:
+        required: true
+
+jobs:
+  build-push:
+    name: ${{ inputs.region }} — build, login, push
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY: ${{ inputs.registry }}
+      IMAGE: trouble-${{ inputs.region }}
+      TAG: ${{ github.run_number }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build da imagem (evidencia de build)
+        run: |
+          set -x
+          docker build -t "$IMAGE:$TAG" -t "$IMAGE:latest" .
+          set +x
+          docker images "$IMAGE"
+          docker image inspect "$IMAGE:$TAG" \
+            --format 'ID={{.Id}}  Created={{.Created}}  Size={{.Size}} bytes'
+
+      - name: Precheck /v2/
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+            "https://$REGISTRY/v2/" || echo "000")
+          echo "[$REGISTRY] GET /v2/ -> HTTP $code (200/401 = alcancado)"
+
+      - name: Docker login (retry contra reset intermitente)
+        env:
+          MGC_USER: ${{ secrets.MGC_USER }}
+          MGC_PASS: ${{ secrets.MGC_PASS }}
+        run: |
+          n=0; max=5
+          until [ "$n" -ge "$max" ]; do
+            n=$((n+1))
+            echo "----- [$REGISTRY] login $n/$max -----"
+            if echo "$MGC_PASS" | docker login "$REGISTRY" -u "$MGC_USER" --password-stdin; then
+              echo "LOGIN OK ($REGISTRY, tentativa $n)"
+              exit 0
+            fi
+            echo "login falhou (possivel reset), aguardando 6s..."
+            sleep 6
+          done
+          echo "LOGIN FALHOU em $REGISTRY apos $max tentativas" >&2
+          exit 1
+
+      - name: Tag e push (se registry_name informado)
+        if: ${{ inputs.registry_name != '' }}
+        run: |
+          set -x
+          FULL="$REGISTRY/${{ inputs.registry_name }}/$IMAGE"
+          docker tag "$IMAGE:$TAG"   "$FULL:$TAG"
+          docker tag "$IMAGE:latest" "$FULL:latest"
+          docker push "$FULL:$TAG"
+          docker push "$FULL:latest"
+          set +x
+          echo "PUSH OK -> $FULL:$TAG e :latest"
+
+      - name: Push pulado (sem registry_name)
+        if: ${{ inputs.registry_name == '' }}
+        run: echo "[$REGISTRY] registry_name vazio: build + login validados; push PULADO."
+
+      - name: Logout
+        if: always()
+        run: docker logout "$REGISTRY" || true

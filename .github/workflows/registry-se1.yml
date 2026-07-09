@@ -1,0 +1,21 @@
+# Action da regiao se1 (Sudeste) — container-registry.br-se1.magalu.cloud
+name: Registry se1
+
+on:
+  workflow_dispatch:
+    inputs:
+      registry_name:
+        description: "nome-do-registro (namespace se1). Vazio = so build+login."
+        required: false
+        default: ""
+
+jobs:
+  se1:
+    uses: ./.github/workflows/_registry-build-push.yml
+    with:
+      region: se1
+      registry: container-registry.br-se1.magalu.cloud
+      registry_name: ${{ inputs.registry_name }}
+    secrets:
+      MGC_USER: ${{ secrets.MGC_SE1_USER }}
+      MGC_PASS: ${{ secrets.MGC_SE1_PASSWORD }}
