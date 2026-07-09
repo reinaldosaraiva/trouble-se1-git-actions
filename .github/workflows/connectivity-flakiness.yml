@@ -1,0 +1,57 @@
+# Quantifica a intermitencia: N tentativas num UNICO runner (IP de egress fixo).
+# Se a mesma IP ora conecta ora reseta, a taxa de falha comprova intermitencia
+# (vs bloqueio deterministico, que daria 0% ou 100%).
+name: Connectivity Flakiness
+
+on:
+  workflow_dispatch:
+
+env:
+  REGISTRY: container-registry.br-se1.magalu.cloud
+
+jobs:
+  measure:
+    name: Medir taxa de reset (IP fixo)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Egress IP deste runner (fixo para todas as amostras)
+        run: |
+          curl -s --max-time 10 https://ipinfo.io/json \
+            | grep -E '"ip"|"city"|"region"|"org"'
+
+      - name: 40x GET /v2/ (mede reset na camada HTTPS)
+        run: |
+          ok=0; fail=0; seq_out=""
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+              "https://$REGISTRY/v2/" 2>/dev/null || echo "000")
+            case "$code" in
+              200|401) ok=$((ok+1)); seq_out="$seq_out." ;;
+              *)       fail=$((fail+1)); seq_out="$seq_out X" ;;
+            esac
+          done
+          echo "sequencia (. = ok, X = reset/fail):"
+          echo "$seq_out"
+          echo "curl /v2/  -> OK=$ok  FAIL=$fail  de 40"
+          echo "taxa de falha HTTPS: $(( fail * 100 / 40 ))%"
+
+      - name: 20x docker login (mede reset no cliente docker)
+        env:
+          MGC_USER: ${{ secrets.MGC_REGISTRY_USER }}
+          MGC_PASS: ${{ secrets.MGC_REGISTRY_PASSWORD }}
+        run: |
+          ok=0; fail=0; seq_out=""
+          for i in $(seq 1 20); do
+            if echo "$MGC_PASS" | docker login "$REGISTRY" -u "$MGC_USER" \
+                 --password-stdin >/dev/null 2>&1; then
+              ok=$((ok+1)); seq_out="$seq_out."
+              docker logout "$REGISTRY" >/dev/null 2>&1
+            else
+              fail=$((fail+1)); seq_out="$seq_out X"
+            fi
+          done
+          echo "sequencia (. = login ok, X = reset/fail):"
+          echo "$seq_out"
+          echo "docker login -> OK=$ok  FAIL=$fail  de 20"
+          echo "taxa de falha docker: $(( fail * 100 / 20 ))%"
