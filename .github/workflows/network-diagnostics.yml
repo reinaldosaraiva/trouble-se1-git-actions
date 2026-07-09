@@ -1,12 +1,10 @@
-# Valida conectividade real com o Magalu Cloud Container Registry (br-se1).
-# Objetivo: responder "chegamos ao registry?" — DNS + TCP/443 + TLS + API /v2/.
-# O MTR (ICMP) fica como diagnostico de rota complementar (nao decide sucesso).
+# Diagnostico VERBOSO de conectividade com o Magalu Cloud Container Registry (br-se1).
+# Cada step imprime o maximo de detalhe e NAO aborta no meio (set +e) — o objetivo
+# e coletar evidencia, nao passar/falhar. Achado atual: TCP/443 abre, mas TLS quebra.
 name: Registry Connectivity
 
 on:
   workflow_dispatch:
-  # Opcional: rodar em cada push para acompanhar regressao de conectividade.
-  # push:
 
 env:
   REGISTRY: container-registry.br-se1.magalu.cloud
@@ -14,81 +12,119 @@ env:
 
 jobs:
   connectivity:
-    name: Registry Connectivity (br-se1)
+    name: Registry Connectivity (br-se1) — verbose
     runs-on: ubuntu-latest
 
     steps:
-      - name: DNS resolution
-        shell: bash
-        run: |
-          echo "## Resolvendo $REGISTRY" | tee -a "$GITHUB_STEP_SUMMARY"
-          if getent hosts "$REGISTRY"; then
-            getent hosts "$REGISTRY" | tee -a "$GITHUB_STEP_SUMMARY"
-            echo "DNS: OK" | tee -a "$GITHUB_STEP_SUMMARY"
-          else
-            echo "DNS: FAILED (nao resolveu)" | tee -a "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-      - name: TCP reachability (port 443)
-        shell: bash
-        run: |
-          echo "## TCP $REGISTRY:$PORT" | tee -a "$GITHUB_STEP_SUMMARY"
-          # Sem netcat externo: usa /dev/tcp do proprio bash, com timeout.
-          if timeout 10 bash -c "exec 3<>/dev/tcp/$REGISTRY/$PORT"; then
-            echo "TCP 443: OPEN (handshake TCP concluido)" | tee -a "$GITHUB_STEP_SUMMARY"
-          else
-            echo "TCP 443: FAILED (porta fechada/filtrada ou timeout)" | tee -a "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-      - name: TLS handshake + certificado
-        shell: bash
-        run: |
-          echo "## TLS $REGISTRY:$PORT" | tee -a "$GITHUB_STEP_SUMMARY"
-          if out=$(echo | timeout 15 openssl s_client -connect "$REGISTRY:$PORT" \
-              -servername "$REGISTRY" 2>/dev/null); then
-            echo "$out" | openssl x509 -noout -subject -issuer -dates 2>/dev/null \
-              | tee -a "$GITHUB_STEP_SUMMARY"
-            echo "TLS: OK" | tee -a "$GITHUB_STEP_SUMMARY"
-          else
-            echo "TLS: FAILED (handshake TLS nao concluiu)" | tee -a "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-      - name: Registry API (/v2/)
-        shell: bash
-        run: |
-          echo "## HTTPS GET https://$REGISTRY/v2/" | tee -a "$GITHUB_STEP_SUMMARY"
-          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
-            "https://$REGISTRY/v2/" || echo "000")
-          echo "HTTP status: $code" | tee -a "$GITHUB_STEP_SUMMARY"
-          # 200 = ok publico | 401 = registry no ar exigindo auth (esperado) | 000 = sem conexao
-          case "$code" in
-            200|401)
-              echo "REGISTRY: ALCANCADO (Docker Registry v2 respondeu $code)" \
-                | tee -a "$GITHUB_STEP_SUMMARY" ;;
-            000)
-              echo "REGISTRY: FAILED (nao houve resposta HTTP)" \
-                | tee -a "$GITHUB_STEP_SUMMARY"; exit 1 ;;
-            *)
-              echo "REGISTRY: RESPOSTA INESPERADA ($code) — alcancado, mas verificar" \
-                | tee -a "$GITHUB_STEP_SUMMARY" ;;
-          esac
-
-      - name: MTR (rota TCP/443 — diagnostico complementar)
+      - name: Ambiente e IP de saida
         continue-on-error: true
         shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes mtr-tiny
-          echo "## MTR (TCP 443) ate $REGISTRY" | tee -a "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          sudo mtr \
-            --report \
-            --report-wide \
-            --report-cycles 10 \
-            --tcp \
-            --port "$PORT" \
-            "$REGISTRY" | tee -a "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          echo "===== IDENTIDADE DO RUNNER ====="
+          echo "Hostname : $(hostname)"
+          echo "Kernel   : $(uname -a)"
+          echo "----- IPs locais -----"
+          ip -brief address 2>/dev/null || ip addr
+          echo "----- IP de saida (egress publico) -----"
+          curl -s --max-time 10 https://ifconfig.me; echo
+          curl -s --max-time 10 https://ipinfo.io/json; echo
+          echo "----- openssl version -----"
+          openssl version -a
+          echo "----- curl version -----"
+          curl --version
+
+      - name: DNS (detalhado)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          echo "===== DNS: $REGISTRY ====="
+          echo "----- getent hosts -----"
+          getent hosts "$REGISTRY"
+          echo "----- getent ahosts (todos os A/AAAA) -----"
+          getent ahosts "$REGISTRY"
+          echo "----- /etc/resolv.conf -----"
+          cat /etc/resolv.conf 2>/dev/null
+          echo "----- host / nslookup (se disponivel) -----"
+          command -v host >/dev/null && host "$REGISTRY"
+          command -v nslookup >/dev/null && nslookup "$REGISTRY"
+
+      - name: TCP 443 (com timing)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          IP=$(getent hosts "$REGISTRY" | awk '{print $1; exit}')
+          echo "===== TCP $REGISTRY ($IP):$PORT ====="
+          START=$(date +%s.%N)
+          timeout 10 bash -c "exec 3<>/dev/tcp/$REGISTRY/$PORT"
+          RC=$?
+          END=$(date +%s.%N)
+          echo "exit code: $RC   (0 = TCP aberto)"
+          echo "tempo do connect: $(echo "$END - $START" | bc 2>/dev/null || echo "?") s"
+          echo "----- curl --connect-only (so TCP) -----"
+          curl -v --max-time 10 --connect-timeout 10 "telnet://$REGISTRY:$PORT" 2>&1 | head -20
+
+      - name: TLS handshake (openssl VERBOSO)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          echo "===== TLS s_client (com SNI, showcerts, state, tlsextdebug) ====="
+          echo | timeout 20 openssl s_client \
+            -connect "$REGISTRY:$PORT" \
+            -servername "$REGISTRY" \
+            -showcerts -state -tlsextdebug -status 2>&1
+          echo "openssl s_client exit code: $?"
+
+          echo
+          echo "===== Testando versoes especificas de TLS ====="
+          for v in tls1_3 tls1_2 tls1_1 tls1; do
+            printf '%-8s -> ' "$v"
+            echo | timeout 15 openssl s_client -"$v" \
+              -connect "$REGISTRY:$PORT" -servername "$REGISTRY" >/dev/null 2>&1
+            echo "exit=$?"
+          done
+
+          echo
+          echo "===== Resumo do certificado (se o handshake passar) ====="
+          echo | timeout 20 openssl s_client -connect "$REGISTRY:$PORT" \
+            -servername "$REGISTRY" 2>/dev/null \
+            | openssl x509 -noout -subject -issuer -dates -ext subjectAltName 2>&1
+
+      - name: HTTPS /v2/ (curl -v com e sem validacao)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          echo "===== curl -v (COM validacao de certificado) ====="
+          curl -v --max-time 25 "https://$REGISTRY/v2/" 2>&1
+          echo "curl (verify) exit code: $?"
+
+          echo
+          echo "===== curl -vk (SEM validacao — distingue cert x rede/TLS) ====="
+          curl -vk --max-time 25 "https://$REGISTRY/v2/" 2>&1
+          echo "curl (insecure) exit code: $?"
+
+          echo
+          echo "===== Status HTTP resumido -----"
+          for opt in "" "-k"; do
+            code=$(curl $opt -sS -o /dev/null -w '%{http_code}' --max-time 25 \
+              "https://$REGISTRY/v2/" 2>/dev/null || echo "000")
+            echo "curl $opt -> HTTP $code  (200/401 = registry alcancado)"
+          done
+
+      - name: MTR TCP/443 (rota)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          sudo apt-get update -qq
+          sudo apt-get install --yes -qq mtr-tiny traceroute
+          echo "===== MTR TCP 443 ====="
+          sudo mtr --report --report-wide --report-cycles 10 \
+            --tcp --port "$PORT" "$REGISTRY"
+          echo
+          echo "===== traceroute TCP 443 (fallback) ====="
+          sudo traceroute -T -p "$PORT" -w 2 -q 1 "$REGISTRY" 2>&1 | head -40
