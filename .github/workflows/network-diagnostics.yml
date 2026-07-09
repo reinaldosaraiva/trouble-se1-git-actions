@@ -1,0 +1,26 @@
+name: Network Diagnostics
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mtr:
+    name: MTR to MCR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install MTR
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes mtr-tiny
+
+      - name: Run MTR to MCR
+        continue-on-error: true
+        shell: bash
+        run: |
+          sudo mtr \
+            --report \
+            --report-wide \
+            --report-cycles 10 \
+            container-registry.br-se1.magalu.cloud
