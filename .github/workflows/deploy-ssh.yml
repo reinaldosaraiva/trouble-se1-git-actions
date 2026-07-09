@@ -1,0 +1,129 @@
+# Pipeline de TESTE: build no CI -> transfere imagem via SSH -> refresh do
+# container isolado 'trouble-deploy-test' no host. NAO toca em producao.
+# Verbosa de proposito: cada etapa imprime evidencia detalhada.
+#
+# Secrets:
+#   DEPLOY_SSH_KEY      -> chave privada SSH (sem passphrase)
+#   DEPLOY_HOST         -> IP/host do servidor
+#   DEPLOY_KNOWN_HOSTS  -> host key (ssh-keyscan) para known_hosts
+#
+# Estrategia sem registry: `docker save | ssh 'docker load'` (autocontido).
+name: Deploy SSH (teste)
+
+on:
+  workflow_dispatch:
+
+env:
+  DEPLOY_USER: ubuntu
+  CONTAINER: trouble-deploy-test
+  IMAGE: trouble-deploy-test
+
+jobs:
+  deploy:
+    name: Build + refresh via SSH
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build da imagem (detalhado)
+        run: |
+          TAG="${{ github.run_number }}"
+          echo "=================================================="
+          echo " BUILD  |  $IMAGE:$TAG"
+          echo "=================================================="
+          set -x
+          docker build -t "$IMAGE:$TAG" -t "$IMAGE:latest" .
+          set +x
+          echo "----- imagens locais -----"
+          docker images "$IMAGE"
+          echo "----- inspect (sha / tamanho / criado) -----"
+          docker image inspect "$IMAGE:$TAG" \
+            --format 'ID={{.Id}}{{"\n"}}Created={{.Created}}{{"\n"}}Size={{.Size}} bytes{{"\n"}}Arch={{.Architecture}}/{{.Os}}'
+          echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Preparar SSH (chave + known_hosts)
+        run: |
+          echo "=================================================="
+          echo " SETUP SSH"
+          echo "=================================================="
+          mkdir -p ~/.ssh
+          printf '%s' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+          echo "----- fingerprint da chave (sem expor material) -----"
+          ssh-keygen -l -f ~/.ssh/id_rsa
+          echo "----- host keys confiaveis (known_hosts) -----"
+          ssh-keygen -l -f ~/.ssh/known_hosts 2>/dev/null || cut -d' ' -f1-2 ~/.ssh/known_hosts
+          echo "alvo: $DEPLOY_USER@${{ secrets.DEPLOY_HOST }}"
+
+      - name: Sanidade da conexao SSH (detalhado)
+        run: |
+          echo "=================================================="
+          echo " SSH SANITY"
+          echo "=================================================="
+          ssh -o BatchMode=yes -o ConnectTimeout=10 \
+            "$DEPLOY_USER@${{ secrets.DEPLOY_HOST }}" \
+            'echo "usuario/host : $(whoami)@$(hostname)"
+             echo "uptime       : $(uptime -p 2>/dev/null || uptime)"
+             echo "kernel       : $(uname -r)"
+             echo "docker       : $(docker --version)"
+             echo "--- disco (/var/lib/docker fica aqui) ---"
+             df -h / | tail -n +1
+             echo "--- containers em execucao no host (contexto) ---"
+             docker ps --format "{{.Names}}\t{{.Image}}\t{{.Status}}"'
+
+      - name: Transferir imagem via SSH (docker save | docker load)
+        run: |
+          echo "=================================================="
+          echo " TRANSFER  |  $IMAGE:$IMAGE_TAG"
+          echo "=================================================="
+          SIZE=$(docker save "$IMAGE:$IMAGE_TAG" | wc -c)
+          echo "tamanho do tar (nao comprimido): $SIZE bytes (~$(( SIZE/1024/1024 )) MB)"
+          echo "----- enviando (gzip) e carregando no host -----"
+          docker save "$IMAGE:$IMAGE_TAG" | gzip \
+            | ssh -o BatchMode=yes -o ConnectTimeout=15 \
+                "$DEPLOY_USER@${{ secrets.DEPLOY_HOST }}" \
+                'gunzip | docker load'
+          echo "----- confirmando imagem presente no host -----"
+          ssh -o BatchMode=yes "$DEPLOY_USER@${{ secrets.DEPLOY_HOST }}" \
+            "docker images $IMAGE --format '{{.Repository}}:{{.Tag}}  {{.ID}}  {{.Size}}'"
+
+      - name: Refresh do container (recria com a imagem nova)
+        run: |
+          echo "=================================================="
+          echo " REFRESH  |  container $CONTAINER"
+          echo "=================================================="
+          ssh -o BatchMode=yes -o ConnectTimeout=15 \
+            "$DEPLOY_USER@${{ secrets.DEPLOY_HOST }}" \
+            "set -e
+             echo '----- ESTADO ANTES -----'
+             docker ps -a --filter name=$CONTAINER \
+               --format '{{.Names}}  {{.Image}}  {{.Status}}  (id {{.ID}})' || echo '(nao existia)'
+             echo '----- removendo container antigo (se houver) -----'
+             docker rm -f $CONTAINER 2>/dev/null && echo 'removido' || echo 'nada para remover'
+             echo '----- subindo container novo -----'
+             NEWID=\$(docker run -d --name $CONTAINER --restart unless-stopped \
+               $IMAGE:$IMAGE_TAG tail -f /dev/null)
+             echo \"novo container id: \$NEWID\"
+             echo '----- ESTADO DEPOIS -----'
+             docker ps --filter name=$CONTAINER \
+               --format '{{.Names}}  {{.Image}}  {{.Status}}  (id {{.ID}})'"
+
+      - name: Verificar deploy (evidencia final)
+        run: |
+          echo "=================================================="
+          echo " VERIFY"
+          echo "=================================================="
+          ssh -o BatchMode=yes -o ConnectTimeout=15 \
+            "$DEPLOY_USER@${{ secrets.DEPLOY_HOST }}" \
+            "echo '----- inspect do container -----'
+             docker inspect -f 'container={{.Name}}{{\"\n\"}}image={{.Config.Image}}{{\"\n\"}}imageID={{.Image}}{{\"\n\"}}status={{.State.Status}}{{\"\n\"}}started={{.State.StartedAt}}{{\"\n\"}}restart={{.HostConfig.RestartPolicy.Name}}' $CONTAINER
+             echo '----- conteudo da imagem (prova do refresh) -----'
+             docker exec $CONTAINER cat /hello.txt
+             echo '----- logs do container -----'
+             docker logs --tail 20 $CONTAINER 2>&1 || true"
+          echo ""
+          echo "DEPLOY OK -> $CONTAINER atualizado para $IMAGE:$IMAGE_TAG em ${{ secrets.DEPLOY_HOST }}"
