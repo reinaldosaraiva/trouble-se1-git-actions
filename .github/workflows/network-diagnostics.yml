@@ -1,3 +1,4 @@
+# MTR (My Traceroute) diagnostics against the Magalu Cloud Container Registry (br-se1).
 name: Network Diagnostics
 
 on:
