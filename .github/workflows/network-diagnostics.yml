@@ -1,27 +1,94 @@
-# MTR (My Traceroute) diagnostics against the Magalu Cloud Container Registry (br-se1).
-name: Network Diagnostics
+# Valida conectividade real com o Magalu Cloud Container Registry (br-se1).
+# Objetivo: responder "chegamos ao registry?" — DNS + TCP/443 + TLS + API /v2/.
+# O MTR (ICMP) fica como diagnostico de rota complementar (nao decide sucesso).
+name: Registry Connectivity
 
 on:
   workflow_dispatch:
+  # Opcional: rodar em cada push para acompanhar regressao de conectividade.
+  # push:
+
+env:
+  REGISTRY: container-registry.br-se1.magalu.cloud
+  PORT: "443"
 
 jobs:
-  mtr:
-    name: MTR to MCR
+  connectivity:
+    name: Registry Connectivity (br-se1)
     runs-on: ubuntu-latest
 
     steps:
-      - name: Install MTR
+      - name: DNS resolution
+        shell: bash
+        run: |
+          echo "## Resolvendo $REGISTRY" | tee -a "$GITHUB_STEP_SUMMARY"
+          if getent hosts "$REGISTRY"; then
+            getent hosts "$REGISTRY" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "DNS: OK" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "DNS: FAILED (nao resolveu)" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: TCP reachability (port 443)
+        shell: bash
+        run: |
+          echo "## TCP $REGISTRY:$PORT" | tee -a "$GITHUB_STEP_SUMMARY"
+          # Sem netcat externo: usa /dev/tcp do proprio bash, com timeout.
+          if timeout 10 bash -c "exec 3<>/dev/tcp/$REGISTRY/$PORT"; then
+            echo "TCP 443: OPEN (handshake TCP concluido)" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "TCP 443: FAILED (porta fechada/filtrada ou timeout)" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: TLS handshake + certificado
+        shell: bash
+        run: |
+          echo "## TLS $REGISTRY:$PORT" | tee -a "$GITHUB_STEP_SUMMARY"
+          if out=$(echo | timeout 15 openssl s_client -connect "$REGISTRY:$PORT" \
+              -servername "$REGISTRY" 2>/dev/null); then
+            echo "$out" | openssl x509 -noout -subject -issuer -dates 2>/dev/null \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "TLS: OK" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "TLS: FAILED (handshake TLS nao concluiu)" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Registry API (/v2/)
+        shell: bash
+        run: |
+          echo "## HTTPS GET https://$REGISTRY/v2/" | tee -a "$GITHUB_STEP_SUMMARY"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+            "https://$REGISTRY/v2/" || echo "000")
+          echo "HTTP status: $code" | tee -a "$GITHUB_STEP_SUMMARY"
+          # 200 = ok publico | 401 = registry no ar exigindo auth (esperado) | 000 = sem conexao
+          case "$code" in
+            200|401)
+              echo "REGISTRY: ALCANCADO (Docker Registry v2 respondeu $code)" \
+                | tee -a "$GITHUB_STEP_SUMMARY" ;;
+            000)
+              echo "REGISTRY: FAILED (nao houve resposta HTTP)" \
+                | tee -a "$GITHUB_STEP_SUMMARY"; exit 1 ;;
+            *)
+              echo "REGISTRY: RESPOSTA INESPERADA ($code) — alcancado, mas verificar" \
+                | tee -a "$GITHUB_STEP_SUMMARY" ;;
+          esac
+
+      - name: MTR (rota TCP/443 — diagnostico complementar)
+        continue-on-error: true
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install --yes mtr-tiny
-
-      - name: Run MTR to MCR
-        continue-on-error: true
-        shell: bash
-        run: |
+          echo "## MTR (TCP 443) ate $REGISTRY" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
           sudo mtr \
             --report \
             --report-wide \
             --report-cycles 10 \
-            container-registry.br-se1.magalu.cloud
+            --tcp \
+            --port "$PORT" \
+            "$REGISTRY" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
