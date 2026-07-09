@@ -63,8 +63,6 @@ jobs:
           END=$(date +%s.%N)
           echo "exit code: $RC   (0 = TCP aberto)"
           echo "tempo do connect: $(echo "$END - $START" | bc 2>/dev/null || echo "?") s"
-          echo "----- curl --connect-only (so TCP) -----"
-          curl -v --max-time 10 --connect-timeout 10 "telnet://$REGISTRY:$PORT" 2>&1 | head -20
 
       - name: TLS handshake (openssl VERBOSO)
         continue-on-error: true
@@ -122,6 +120,10 @@ jobs:
           set +e
           sudo apt-get update -qq
           sudo apt-get install --yes -qq mtr-tiny traceroute
+          echo "NOTA: hops '*' aqui = o egress do runner (Azure) filtra as"
+          echo "respostas ICMP/UDP 'TTL exceeded'. Isso esconde a ROTA, mas NAO"
+          echo "significa falta de conectividade — o alcance ja foi provado nos"
+          echo "steps TCP/TLS/HTTP acima. Rota real so via self-hosted runner no br-se1."
           echo "===== MTR TCP 443 ====="
           sudo mtr --report --report-wide --report-cycles 10 \
             --tcp --port "$PORT" "$REGISTRY"
