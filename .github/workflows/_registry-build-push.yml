@@ -84,7 +84,8 @@ jobs:
 
       - name: Push pulado (sem registry_name)
         if: ${{ inputs.registry_name == '' }}
-        run: echo "[$REGISTRY] registry_name vazio: build + login validados; push PULADO."
+        run: |
+          echo "[$REGISTRY] registry_name vazio: build + login validados; push PULADO."
 
       - name: Logout
         if: always()
